@@ -1,4 +1,15 @@
 # DehazingCNNMaterial
+He Zhang (S’14) received the Ph.D. degree in
+electrical and computer engineering from Rutgers
+University, New Brunswick, NJ, USA, in 2018.
+He is currently a Research Scientist with Adobe,
+San Jose, CA, USA. His research interests include
+image restoration, image compositing, generative
+adversarial network, deep learning, and sparse and
+low-rank representation.
+
+
+
 from collections import namedtuple
 from cv2.ximgproc import guidedFilter
 from net import *
