@@ -1,4 +1,254 @@
 # DehazingCNNMaterial
+from collections import namedtuple
+from cv2.ximgproc import guidedFilter
+from net import *
+from net.losses import StdLoss
+from net.vae_model import VAE
+from utils.imresize import np_imresize
+from utils.image_io import *
+from utils.dcp import get_atmosphere
+from fusion import ImageDehazing
+from skimage.io import imread, imsave
+#from skimage.measure import compare_psnr, compare_ssim
+import torch
+import torch.nn as nn
+import numpy as np
+from model import GridDehazeNet
+DehazeResult = namedtuple("DehazeResult", ['learned', 't', 'a'])
+def gradient(y):
+    gradient_h=torch.abs(y[:, :, :, :-1] - y[:, :, :, 1:])
+    gradient_y=torch.abs(y[:, :, :-1, :] - y[:, :, 1:, :])
+    return gradient_h, gradient_y
+
+class Dehaze(object):
+    def __init__(self, image_name, image, num_iter=1000, clip=True, output_path="output/"):
+        self.image_name = image_name
+        self.image = image
+        self.num_iter = num_iter
+        self.ambient_net = None
+        self.image_net = None
+        self.mask_net = None
+        self.ambient_val = None
+        self.mse_loss = None
+        self.learning_rate = 0.003
+        self.parameters = None
+        self.current_result = None
+        self.output_path = output_path
+
+        self.clip = clip
+        self.blur_loss = None
+        self.best_result_psnr = None
+        self.best_result_ssim = None
+        self.image_net_inputs = None
+        self.mask_net_inputs = None
+        self.image_out = None
+        self.mask_out = None
+        self.ambient_out = None
+        self.total_loss = None
+        self.input_depth = 3
+        self.post = None
+        self.adaptiveavg= nn.AdaptiveAvgPool2d(1)
+        self.batch_size = None
+        self._init_all()
+
+    def _init_images(self):
+        self.original_image = self.image.copy()
+        self.images_torch = np_to_torch(self.image).type(torch.cuda.FloatTensor)
+
+    def _init_nets(self):
+        input_depth = self.input_depth
+        data_type = torch.cuda.FloatTensor
+        pad = 'reflection'
+
+        image_net = skip(
+            input_depth, 3,
+            num_channels_down=[8, 16, 32, 64, 128],
+            num_channels_up=[8, 16, 32, 64, 128],
+            num_channels_skip=[0, 0, 0, 4, 4],
+            upsample_mode='bilinear',
+            need_sigmoid=True, need_bias=True, pad=pad, act_fun='LeakyReLU')
+        self.image_net  = GridDehazeNet(height=3, width=6, num_dense_layer=4, growth_rate=16).type(data_type)
+        self.image_net = nn.DataParallel(self.image_net, device_ids=[0])
+        self.image_net.load_state_dict(torch.load('{}_haze_best_{}_{}'.format('outdoor', 3, 6)))
+        mask_net = skip(
+            input_depth, 1,
+            num_channels_down=[8, 16, 32, 64, 128],
+            num_channels_up=[8, 16, 32, 64, 128],
+            num_channels_skip=[0, 0, 0, 4, 4],
+            upsample_mode='bilinear',
+            need_sigmoid=True, need_bias=True, pad=pad, act_fun='LeakyReLU')
+
+        self.mask_net = mask_net.type(data_type)
+
+    def _init_ambient(self):
+        ambient_net = VAE(self.image.shape)
+        self.ambient_net = ambient_net.type(torch.cuda.FloatTensor)
+
+        atmosphere = get_atmosphere(self.image)
+        self.ambient_val = nn.Parameter(data=torch.cuda.FloatTensor(atmosphere.reshape((1, 3, 1, 1))),
+                                        requires_grad=False)
+        self.at_back = atmosphere
+
+    def _init_parameters(self):
+        parameters = [p for p in self.image_net.parameters()] + \
+                     [p for p in self.mask_net.parameters()]
+        parameters += [p for p in self.ambient_net.parameters()]
+
+        self.parameters = parameters
+
+    def _init_loss(self):
+        data_type = torch.cuda.FloatTensor
+        self.mse_loss = torch.nn.MSELoss().type(data_type)
+        self.blur_loss = StdLoss().type(data_type)
+
+    def _init_inputs(self):
+        self.image_net_inputs = np_to_torch(self.image).cuda()
+        self.mask_net_inputs = np_to_torch(self.image).cuda()
+        self.ambient_net_input = np_to_torch(self.image).cuda()
+        self.gradie_h_gt, self.gradie_v_gt=gradient(self.image_net_inputs)
+
+    def _init_all(self):
+        self._init_images()
+        self._init_nets()
+        self._init_ambient()
+        self._init_inputs()
+        self._init_parameters()
+        self._init_loss()
+
+    def optimize(self):
+        torch.backends.cudnn.enabled = True
+        torch.backends.cudnn.benchmark = True
+
+        optimizer = torch.optim.Adam(self.parameters, lr=self.learning_rate)
+        self.batch_size = self.images_torch.shape
+        for j in range(self.num_iter):
+            optimizer.zero_grad()
+            self._optimization_closure()
+            self._obtain_current_result(j)
+            self._plot_closure(j)
+            optimizer.step()
+
+    def _optimization_closure(self):
+        self.image_out = self.image_net(self.image_net_inputs)
+        self.ambient_out = self.ambient_net(self.ambient_net_input)
+
+        self.mask_out = self.mask_net(self.mask_net_inputs)
+        #self.mask_out[self.mask_out<0.05]=0.05
+        self.blur_out = self.blur_loss(self.mask_out)
+        gradie_h_gt, gradie_v_gt=gradient(self.image_net_inputs)
+        
+        gradie_h_est, gradie_v_est=gradient(self.image_out)
+        
+        self.gradie_h_gt=torch.max(gradie_h_est,gradie_h_gt).detach()
+        self.gradie_v_gt=torch.max(gradie_v_est,gradie_v_gt).detach()
+        L_tran_v = self.mse_loss(gradie_v_est, self.gradie_v_gt)+self.mse_loss(gradie_h_est, self.gradie_h_gt)
+
+        #self.mse_loss(self.mask_out * self.image_out + (1 - self.mask_out) * tmpair,
+                                     #self.images_torch)+
+        tmpair=self.adaptiveavg((1 - self.mask_out)*self.images_torch)/self.adaptiveavg(1 - self.mask_out)+0.1
+        tmpair[tmpair<0.6]=0.6
+        tmpimg=(self.images_torch-tmpair)/self.mask_out+tmpair
+        smooth_x,smooth_y=gradient(self.mask_out)
+
+            
+        #print (batch_size)
+        #tmpambient_out=tmpair.repeat(1,1,self.batch_size[2],self.batch_size[3])
+        self.mseloss = self.mse_loss(self.mask_out * self.image_out + (1 - self.mask_out) * self.ambient_out,
+                                     self.images_torch)+(torch.mean(smooth_x)+torch.mean(smooth_x))*0.05+L_tran_v*0.5+(torch.mean(gradie_h_est)+torch.mean(gradie_v_est))#+self.mse_loss(self.image_out,tmpimg)
+        vae_loss = self.ambient_net.getLoss()
+        self.total_loss = self.mseloss + vae_loss
+        self.total_loss += 0.005 * self.blur_out
+        self.total_loss +=self.mse_loss(torch.mean(self.image_out),torch.mean(self.image_net_inputs))
+        dcp_prior = torch.min(self.image_out.permute(0, 2, 3, 1), 3)[0]
+        self.dcp_loss = self.mse_loss(dcp_prior, torch.zeros_like(dcp_prior)) - 0.05
+        self.total_loss += self.dcp_loss
+        if (self.current_result):
+            self.total_loss += self.mse_loss(self.ambient_out, np_to_torch(self.current_result.a).type(torch.cuda.FloatTensor))
+            self.total_loss += self.mse_loss(self.mask_out, np_to_torch(self.current_result.t).type(torch.cuda.FloatTensor))
+            self.total_loss += self.mse_loss(self.image_out, np_to_torch(self.current_result.learned).type(torch.cuda.FloatTensor))
+        #self.total_loss += 0.1 * self.blur_loss(self.ambient_out)
+        self.total_loss += self.mse_loss(self.ambient_out, tmpair * torch.ones_like(self.ambient_out))
+
+        self.total_loss.backward(retain_graph=True)
+
+    def _obtain_current_result(self, step):
+        if step % 5 == 0:
+            image_out_np = np.clip(torch_to_np(self.image_out), 0, 1)
+            mask_out_np = np.clip(torch_to_np(self.mask_out), 0, 1)
+            ambient_out_np = np.clip(torch_to_np(self.ambient_out), 0, 1)
+            ambient_out_np[0,:,:]=self.A_matting(ambient_out_np[0,:,:])
+            ambient_out_np[1,:,:]=self.A_matting(ambient_out_np[1,:,:])
+            ambient_out_np[2,:,:]=self.A_matting(ambient_out_np[2,:,:])
+            mask_out_np[mask_out_np<0.1]=0.1
+            mask_out_np = self.t_matting(mask_out_np)
+            self.current_result = DehazeResult(learned=image_out_np, t=mask_out_np, a=ambient_out_np)
+
+    def _plot_closure(self, step):
+        """
+         :param step: the number of the iteration
+
+         :return:
+         """
+        print('Iteration %05d    Loss %f  %f\n' % (step, self.total_loss.item(), self.blur_out.item()), '\r', end='')
+
+    def finalize(self):
+        self.final_t_map = np_imresize(self.current_result.t, output_shape=self.original_image.shape[1:])
+        self.final_a = np_imresize(self.current_result.a, output_shape=self.original_image.shape[1:])
+        mask_out_np = self.t_matting(self.final_t_map)
+        mask_out_np[mask_out_np<0.1]=0.1
+        self.final_a[0,:,:]=self.A_matting(self.final_a[0,:,:])
+        self.final_a[1,:,:]=self.A_matting(self.final_a[1,:,:])
+        self.final_a[2,:,:]=self.A_matting(self.final_a[2,:,:])
+        post = np.clip((self.original_image - ((1 - mask_out_np) * self.final_a)) / mask_out_np, 0, 1)
+        dehazer = ImageDehazing(verbose=False)
+        #print (self.original_image.shape,post.shape)
+       
+        posttest = dehazer.dehaze([np_to_pil(self.original_image),np_to_pil(post)], pyramid_height=15)
+        posttest['dehazed'] = np.clip(posttest['dehazed'], 0, 1)
+        #posttest['dehazed'].save(output_path + "{}.jpg".format(self.image_name))
+        imsave('output/'+self.image_name+'.jpg', posttest['dehazed'])
+        #save_image(self.image_name + "_run_final", posttest, self.output_path)
+        save_image(self.image_name + "_run_final_out", self.current_result.learned, self.output_path)
+
+    def A_matting(self, mask_out_np):
+        #print (self.original_image.transpose(1, 2, 0).shape,mask_out_np.astype(np.float32).shape)
+        refine_t = guidedFilter(self.original_image.transpose(1, 2, 0).astype(np.float32),
+                                mask_out_np.astype(np.float32), 50, 1e-4)
+        if self.clip:
+            return np.array([np.clip(refine_t, 0.1, 1)])
+        else:
+            return np.array([np.clip(refine_t, 0, 1)])
+    def t_matting(self, mask_out_np):
+        refine_t = guidedFilter(self.original_image.transpose(1, 2, 0).astype(np.float32),
+                                mask_out_np[0].astype(np.float32), 50, 1e-4)
+        if self.clip:
+            return np.array([np.clip(refine_t, 0.1, 1)])
+        else:
+            return np.array([np.clip(refine_t, 0, 1)])
+
+
+def dehaze(image_name, image, num_iter=350, output_path="output/"):
+    dh = Dehaze(image_name, image, num_iter, clip=True, output_path=output_path)
+
+    dh.optimize()
+    dh.finalize()
+
+    save_image(image_name + "_original", np.clip(image, 0, 1), dh.output_path)
+
+if __name__ == "__main__":
+    torch.cuda.set_device(0)
+
+    hazy_add = 'data/canon_input.png'
+    name = "canon_input111"
+    print(name)
+
+    hazy_img = prepare_hazy_image(hazy_add)
+    #print (hazy_img.shape)
+    dehaze(name, hazy_img, num_iter=500, output_path="output/")
+
+
+
+
 import numpy as np
 
 import cv2 as cv
