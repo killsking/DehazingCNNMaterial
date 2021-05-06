@@ -1,3 +1,13 @@
+
+import cv2
+img1=cv2.imread('')
+img2=cv2.imread('')
+m1, d1 = cv2.meanStdDev(img1)
+m2, d2 = cv2.meanStdDev(img2)
+img3=(img1-m1)/d1*d2+m2
+cv2.imwrite('resut.jpg',img3)
+
+
 # DehazingCNNMaterial
 He Zhang (S’14) received the Ph.D. degree in
 electrical and computer engineering from Rutgers
